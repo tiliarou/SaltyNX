@@ -1,20 +1,27 @@
 #include <switch.h>
 
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <switch_min/kernel/svc_extra.h>
 #include <switch/kernel/ipc.h>
 #include "saltysd_bootstrap_elf.h"
-#include "saltysd_core_elf.h"
 
 #include "spawner_ipc.h"
 
+#include "loadelf.h"
 #include "useful.h"
+
+#define MODULE_SALTYSD 420
 
 u32 __nx_applet_type = AppletType_None;
 
 void serviceThread(void* buf);
-static char g_heap[0x20000];
+
+Handle saltyport, sdcard;
+static char g_heap[0x100000];
 bool should_terminate = false;
+bool already_hijacking = false;
 
 void __libnx_initheap(void)
 {
@@ -27,7 +34,7 @@ void __libnx_initheap(void)
 
 void __appInit(void)
 {
-    smInitialize();
+    
 }
 
 void hijack_bootstrap(Handle* debug, u64 pid, u64 tid)
@@ -36,6 +43,13 @@ void hijack_bootstrap(Handle* debug, u64 pid, u64 tid)
     Result ret;
     
     ret = svcGetDebugThreadContext(&context, *debug, tid, RegisterGroup_All);
+    if (ret)
+    {
+        SaltySD_printf("SaltySD: svcGetDebugThreadContext returned %x, aborting...\n", ret);
+        
+        svcCloseHandle(*debug);
+        return;
+    }
     
     // Load in the ELF
     //svcReadDebugProcessMemory(backup, debug, context.pc.x, 0x1000);
@@ -49,6 +63,10 @@ void hijack_bootstrap(Handle* debug, u64 pid, u64 tid)
     // Set new PC
     context.pc.x = new_start;
     ret = svcSetDebugThreadContext(*debug, tid, &context, RegisterGroup_All);
+    if (ret)
+    {
+        SaltySD_printf("SaltySD: svcSetDebugThreadContext returned %x!\n", ret);
+    }
      
     svcCloseHandle(*debug);
 }
@@ -58,6 +76,14 @@ void hijack_pid(u64 pid)
     Result ret;
     u32 threads;
     Handle debug;
+    
+    if (already_hijacking)
+    {
+        SaltySD_printf("SaltySD: PID %llx spawned before last hijack finished bootstrapping! Ignoring...\n", pid);
+        return;
+    }
+    
+    already_hijacking = true;
     svcDebugActiveProcess(&debug, pid);
 
     u64* tids = malloc(0x200 * sizeof(u64));
@@ -70,29 +96,63 @@ void hijack_pid(u64 pid)
     }
     while (!threads);
     
-    ThreadContext context, oldContext;
+    ThreadContext context;
     ret = svcGetDebugThreadContext(&context, debug, tids[0], RegisterGroup_All);
-    oldContext = context;
 
-    write_log("SaltySD: new max %llx, %x %016llx\n", pid, threads, context.pc.x);
-    /*write_log("x0  %016llx x1  %016llx x2  %016llx x3  %016llx\n", context.cpu_gprs[0].x, context.cpu_gprs[1].x, context.cpu_gprs[2].x, context.cpu_gprs[3].x);
-    write_log("x4  %016llx x5  %016llx x6  %016llx x7  %016llx\n", context.cpu_gprs[4].x, context.cpu_gprs[5].x, context.cpu_gprs[6].x, context.cpu_gprs[7].x);
-    write_log("x8  %016llx x9  %016llx x10 %016llx x11 %016llx\n", context.cpu_gprs[8].x, context.cpu_gprs[9].x, context.cpu_gprs[10].x, context.cpu_gprs[11].x);
-    write_log("x12 %016llx x13 %016llx x14 %016llx x15 %016llx\n", context.cpu_gprs[12].x, context.cpu_gprs[13].x, context.cpu_gprs[14].x, context.cpu_gprs[15].x);
-    write_log("x16 %016llx x17 %016llx x18 %016llx x19 %016llx\n", context.cpu_gprs[16].x, context.cpu_gprs[17].x, context.cpu_gprs[18].x, context.cpu_gprs[19].x);
-    write_log("x20 %016llx x21 %016llx x22 %016llx x23 %016llx\n", context.cpu_gprs[20].x, context.cpu_gprs[21].x, context.cpu_gprs[22].x, context.cpu_gprs[23].x);
-    write_log("x24 %016llx x25 %016llx x26 %016llx x27 %016llx\n", context.cpu_gprs[24].x, context.cpu_gprs[25].x, context.cpu_gprs[26].x, context.cpu_gprs[27].x);
-    write_log("x28 %016llx\n", context.cpu_gprs[28].x);
-    write_log("sp %016llx lr %016llx pc %016llx\n", context.sp, context.lr, context.pc.x);*/
-            
+    SaltySD_printf("SaltySD: new max %lx, %x %016lx\n", pid, threads, context.pc.x);
+
+    DebugEventInfo eventinfo;
+    while (1)
+    {
+        ret = svcGetDebugEventInfo(&eventinfo, debug);
+        if (ret)
+        {
+            SaltySD_printf("SaltySD: svcGetDebugEventInfo returned %x, breaking\n", ret);
+            // Invalid Handle
+            if (ret == 0xe401)
+                goto abort_bootstrap;
+            break;
+        }
+
+        if (eventinfo.type == DebugEvent_AttachProcess)
+        {
+            SaltySD_printf("SaltySD: found AttachProcess event:\n");
+            SaltySD_printf("         tid %016llx pid %016llx\n", eventinfo.tid, eventinfo.pid);
+            SaltySD_printf("         name %s\n", eventinfo.name);
+            SaltySD_printf("         isA64 %01x addrSpace %01x enableDebug %01x\n", eventinfo.isA64, eventinfo.addrSpace, eventinfo.enableDebug);
+            SaltySD_printf("         enableAslr %01x useSysMemBlocks %01x poolPartition %01x\n", eventinfo.enableAslr, eventinfo.useSysMemBlocks, eventinfo.poolPartition);
+            SaltySD_printf("         exception %016llx\n", eventinfo.userExceptionContextAddr);
+
+            if (!eventinfo.isA64)
+            {
+                SaltySD_printf("SaltySD: ARM32 applications are not supported, aborting bootstrap...\n");
+                goto abort_bootstrap;
+            }
+
+            if (eventinfo.tid <= 0x010000000000FFFF)
+            {
+                SaltySD_printf("SaltySD: TID %016llx is a system application, aborting bootstrap...\n", eventinfo.tid);
+                goto abort_bootstrap;
+            }
+        }
+        else
+        {
+            SaltySD_printf("SaltySD: debug event %x, passing...\n", eventinfo.type);
+            continue;
+        }
+    }
+
     hijack_bootstrap(&debug, pid, tids[0]);
     
-    serviceThread(NULL);
-    
     free(tids);
-}
+    return;
 
-Result svcQueryProcessMemory(MemoryInfo* meminfo_ptr, u32* pageinfo, Handle debug, u64 addr);
+abort_bootstrap:
+    free(tids);
+                
+    already_hijacking = false;
+    svcCloseHandle(debug);
+}
 
 Result handleServiceCmd(int cmd)
 {
@@ -107,60 +167,98 @@ Result handleServiceCmd(int cmd)
     {
         ret = 0;
         should_terminate = true;
+        //SaltySD_printf("SaltySD: cmd 0, terminating\n");
     }
-    else if (cmd == 1) // LoadCore
+    else if (cmd == 1) // LoadELF
     {
-        IpcParsedCommand r;
+        IpcParsedCommand r = {0};
         ipcParse(&r);
 
         struct {
             u64 magic;
             u64 command;
             u64 heap;
+            char name[64];
             u32 reserved[2];
         } *resp = r.Raw;
 
         Handle proc = r.Handles[0];
-        write_log("SaltySD: cmd 1 handler, proc handle %x, heap %llx\n", proc, resp->heap);
+        u64 heap = resp->heap;
+        char name[64];
         
-        u64 new_start;
-        ret = load_elf_proc(proc, r.Pid, resp->heap, &new_start, saltysd_core_elf, saltysd_core_elf_size);
+        memcpy(name, resp->name, 64);
         
-        /*u64 addr = 0;
-        while (1)
-        {
-            MemoryInfo info;
-            u32 pageinfo;
-            Result ret = svcQueryProcessMemory(&info, &pageinfo, proc, addr);
-            
-            write_log("SaltySD: %016llx, size %llx\n", info.addr, info.size);
+        SaltySD_printf("SaltySD: cmd 1 handler, proc handle %x, heap %llx, path %s\n", proc, heap, name);
+        
+        char* path = malloc(96);
+        uint8_t* elf_data = NULL;
+        u32 elf_size = 0;
 
-            addr = info.addr + info.size;
+        snprintf(path, 96, "sdmc:/SaltySD/plugins/%s", name);
+        FILE* f = fopen(path, "rb");
+        if (!f)
+        {
+            snprintf(path, 96, "sdmc:/SaltySD/%s", name);
+            f = fopen(path, "rb");
+        }
+
+        if (!f)
+        {
+            SaltySD_printf("SaltySD: failed to load plugin `%s'!\n", name);
+            elf_data = NULL;
+            elf_size = 0;
+        }
+        else if (f)
+        {
+            fseek(f, 0, SEEK_END);
+            elf_size = ftell(f);
+            fseek(f, 0, SEEK_SET);
             
-            if (!addr || ret) break;
-        }*/
+            SaltySD_printf("SaltySD: loading %s, size 0x%x\n", path, elf_size);
+            
+            elf_data = malloc(elf_size);
+            
+            fread(elf_data, elf_size, 1, f);
+        }
+        free(path);
         
+        u64 new_start = 0, new_size = 0;
+        if (elf_data && elf_size)
+            ret = load_elf_proc(proc, r.Pid, heap, &new_start, &new_size, elf_data, elf_size);
+        else
+            ret = MAKERESULT(MODULE_SALTYSD, 1);
+
         svcCloseHandle(proc);
+        
+        if (f)
+        {
+            if (elf_data)
+                free(elf_data);
+            fclose(f);
+        }
         
         // Ship off results
         struct {
             u64 magic;
             u64 result;
             u64 new_addr;
-            u64 reserved[1];
+            u64 new_size;
         } *raw;
 
         raw = ipcPrepareHeader(&c, sizeof(*raw));
 
         raw->magic = SFCO_MAGIC;
-        raw->result = 0;
+        raw->result = ret;
         raw->new_addr = new_start;
+        raw->new_size = new_size;
+        
+        debug_log("SaltySD: new_addr to %lx, %x\n", new_start, ret);
 
         return 0;
     }
     else if (cmd == 2) // RestoreBootstrapCode
     {
-        IpcParsedCommand r;
+        IpcParsedCommand r = {0};
         ipcParse(&r);
 
         struct {
@@ -169,7 +267,7 @@ Result handleServiceCmd(int cmd)
             u32 reserved[4];
         } *resp = r.Raw;
 
-        write_log("SaltySD: cmd 2 handler\n");
+        SaltySD_printf("SaltySD: cmd 2 handler\n");
         
         Handle debug;
         ret = svcDebugActiveProcess(&debug, r.Pid);
@@ -177,12 +275,14 @@ Result handleServiceCmd(int cmd)
         {
             ret = restore_elf_debug(debug);
         }
-
+        
+        // Bootstrapping is done, we can handle another process now.
+        already_hijacking = false;
         svcCloseHandle(debug);
     }
     else if (cmd == 3) // Memcpy
     {
-        IpcParsedCommand r;
+        IpcParsedCommand r = {0};
         ipcParse(&r);
 
         struct {
@@ -192,21 +292,27 @@ Result handleServiceCmd(int cmd)
             u64 from;
             u64 size;
         } *resp = r.Raw;
+        
+        u64 to, from, size;
+        to = resp->to;
+        from = resp->from;
+        size = resp->size;
 
-        write_log("SaltySD: cmd 3 handler, memcpy(%llx, %llx, %llx)\n", resp->to, resp->from, resp->size);
+        SaltySD_printf("SaltySD: cmd 3 handler, memcpy(%llx, %llx, %llx)\n", to, from, size);
         
         Handle debug;
         ret = svcDebugActiveProcess(&debug, r.Pid);
         if (!ret)
         {
-            u8* tmp = malloc(resp->size);
+            u8* tmp = malloc(size);
 
-            ret = svcReadDebugProcessMemory(tmp, debug, resp->from, resp->size);
-            ret = svcWriteDebugProcessMemory(debug, tmp, resp->to, resp->size);
+            ret = svcReadDebugProcessMemory(tmp, debug, from, size);
+            if (!ret)
+                ret = svcWriteDebugProcessMemory(debug, tmp, to, size);
 
             free(tmp);
             
-            ret = svcCloseHandle(debug);
+            svcCloseHandle(debug);
         }
         
         // Ship off results
@@ -219,9 +325,31 @@ Result handleServiceCmd(int cmd)
         raw = ipcPrepareHeader(&c, sizeof(*raw));
 
         raw->magic = SFCO_MAGIC;
-        raw->result = 0;
+        raw->result = ret;
 
         return 0;
+    }
+    else if (cmd == 4) // GetSDCard
+    {        
+        SaltySD_printf("SaltySD: cmd 4 handler\n");
+
+        ipcSendHandleCopy(&c, sdcard);
+    }
+    else if (cmd == 5) // Log
+    {
+        IpcParsedCommand r = {0};
+        ipcParse(&r);
+
+        struct {
+            u64 magic;
+            u64 command;
+            char log[64];
+            u32 reserved[2];
+        } *resp = r.Raw;
+
+        SaltySD_printf(resp->log);
+
+        ret = 0;
     }
     else
     {
@@ -242,13 +370,10 @@ Result handleServiceCmd(int cmd)
     return ret;
 }
 
-Handle saltyport;
-u8 stack[0x8000];
-
 void serviceThread(void* buf)
 {
     Result ret;
-    write_log("SaltySD: accepting service calls\n");
+    //SaltySD_printf("SaltySD: accepting service calls\n");
     should_terminate = false;
 
     while (1)
@@ -257,14 +382,13 @@ void serviceThread(void* buf)
         ret = svcAcceptSession(&session, saltyport);
         if (ret && ret != 0xf201)
         {
-            //write_log("SaltySD: svcAcceptSession returned %x\n", ret);
+            //SaltySD_printf("SaltySD: svcAcceptSession returned %x\n", ret);
         }
         else if (!ret)
         {
-            //write_log("SaltySD: session %x being handled\n", session);
+            //SaltySD_printf("SaltySD: session %x being handled\n", session);
 
             int handle_index;
-            int reply_num = 0;
             Handle replySession = 0;
             while (1)
             {
@@ -272,7 +396,7 @@ void serviceThread(void* buf)
                 
                 if (should_terminate) break;
                 
-                //write_log("SaltySD: IPC reply ret %x, index %x, sess %x\n", ret, handle_index, session);
+                //SaltySD_printf("SaltySD: IPC reply ret %x, index %x, sess %x\n", ret, handle_index, session);
                 if (ret) break;
                 
                 IpcParsedCommand r;
@@ -285,6 +409,8 @@ void serviceThread(void* buf)
                 } *resp = r.Raw;
 
                 handleServiceCmd(resp->command);
+                
+                if (should_terminate) break;
 
                 replySession = session;
                 svcSleepThread(1000*1000);
@@ -295,22 +421,18 @@ void serviceThread(void* buf)
 
         if (should_terminate) break;
         
-        //write_log("SaltySD: ..\n", ret);
         svcSleepThread(1000*1000*100);
     }
     
-    write_log("SaltySD: done accepting service calls\n");
-    
-    //svcCloseHandle(saltyport);
-    //svcExitThread();
+    //SaltySD_printf("SaltySD: done accepting service calls\n");
 }
 
 int main(int argc, char *argv[])
 {
     Result ret;
-    Handle port, fsp, thread;
+    Handle port;
     
-    write_log("SaltySD says hello!\n");
+    debug_log("SaltySD says hello!\n");
     
     do
     {
@@ -320,17 +442,20 @@ int main(int argc, char *argv[])
     while (ret);
     
     // Begin asking for handles
-    get_handle(port, &fsp, "fsp-srv");
-    get_port(port, &saltyport, "SaltySD");
+    get_handle(port, &sdcard, "sdcard");
     terminate_spawner(port);
     svcCloseHandle(port);
-
-    /*ret = svcCreateThread(&thread, serviceThread, NULL, &stack[0x8000],0x31, 3);
-    write_log("SaltySD: create thread %x\n", ret);
-    ret = svcStartThread(thread);
-    write_log("SaltySD: start thread %x\n", ret);*/
-    serviceThread(NULL);
     
+    // Init fs stuff
+    FsFileSystem sdcardfs;
+    sdcardfs.s.handle = sdcard;
+    fsdevMountDevice("sdmc", sdcardfs);
+
+    // Start our port
+    // For some reason, we only have one session maximum (0 reslimit handle related?)    
+    ret = svcManageNamedPort(&saltyport, "SaltySD", 1);
+
+    // Main service loop
     u64* pids = malloc(0x200 * sizeof(u64));
     u64 max = 0;
     while (1)
@@ -352,11 +477,18 @@ int main(int argc, char *argv[])
         {
             hijack_pid(max);
         }
+        
+        // If someone is waiting for us, handle them.
+        if (!svcWaitSynchronizationSingle(saltyport, 1000))
+        {
+            serviceThread(NULL);
+        }
 
-        //write_log("SaltySD: .\n", ret);
         svcSleepThread(1000*1000);
     }
     free(pids);
+    
+    fsdevUnmountAll();
 
     return 0;
 }
